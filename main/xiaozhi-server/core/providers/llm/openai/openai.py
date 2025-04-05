@@ -57,6 +57,8 @@ class LLMProvider(LLMProviderBase):
                 model=self.model_name,
                 messages=dialogue,
                 stream=True,
+                temperature=0.5,
+                top_p=0.7,
                 tools=functions
             )
 
