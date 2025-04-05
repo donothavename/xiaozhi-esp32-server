@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import uuid
 import time
@@ -73,7 +74,7 @@ class ConnectionHandler:
         self.intent = _intent
 
         # vad相关变量
-        self.client_audio_buffer = bytes()
+        self.client_audio_buffer = bytearray()
         self.client_have_voice = False
         self.client_have_voice_last_time = 0.0
         self.client_no_voice_last_time = 0.0
@@ -448,7 +449,7 @@ class ConnectionHandler:
             if tools_call is not None:
                 tool_call_flag = True
                 if tools_call[0].id is not None:
-                    function_id = tools_call[0].id
+                    function_id = (function_id if function_id is not None else "") + tools_call[0].id
                 if tools_call[0].function.name is not None:
                     function_name = tools_call[0].function.name
                 if tools_call[0].function.arguments is not None:
@@ -471,32 +472,39 @@ class ConnectionHandler:
                     full_text = "".join(response_message)
                     current_text = full_text[processed_chars:]  # 从未处理的位置开始
 
-                    # 查找最后一个有效标点
-                    punctuations = ("。", "？", "！", "；", "：")
-                    last_punct_pos = -1
-                    for punct in punctuations:
-                        pos = current_text.rfind(punct)
-                        if pos > last_punct_pos:
-                            last_punct_pos = pos
+                    if re.search('[a-zA-Z0-9_-]+[\n|>]{.*',current_text) is None:
+                        # 查找最后一个有效标点
+                        punctuations = ("。", "？", "！", "；", "：")
+                        last_punct_pos = -1
+                        for punct in punctuations:
+                            pos = current_text.rfind(punct)
+                            if pos > last_punct_pos:
+                                last_punct_pos = pos
 
-                    # 找到分割点则处理
-                    if last_punct_pos != -1:
-                        segment_text_raw = current_text[: last_punct_pos + 1]
-                        segment_text = get_string_no_punctuation_or_emoji(
-                            segment_text_raw
-                        )
-                        if segment_text:
-                            text_index += 1
-                            self.recode_first_last_text(segment_text, text_index)
-                            future = self.executor.submit(
-                                self.speak_and_play, segment_text, text_index
+                        # 找到分割点则处理
+                        if last_punct_pos != -1:
+                            segment_text_raw = current_text[: last_punct_pos + 1]
+                            segment_text = get_string_no_punctuation_or_emoji(
+                                segment_text_raw
                             )
-                            self.tts_queue.put(future)
-                            # 更新已处理字符位置
-                            processed_chars += len(segment_text_raw)
+                            if segment_text:
+                                text_index += 1
+                                self.recode_first_last_text(segment_text, text_index)
+                                future = self.executor.submit(
+                                    self.speak_and_play, segment_text, text_index
+                                )
+                                self.tts_queue.put(future)
+                                # 更新已处理字符位置
+                                processed_chars += len(segment_text_raw)
 
         # 处理function call
         if tool_call_flag:
+            print(function_name, function_arguments)
+            function_arguments = re.sub(r'\\', '', function_arguments)
+            function_arguments = re.sub(r'(?<!: )\" \{', '{', function_arguments)
+            function_arguments = re.sub(r'} ?"}', '}', function_arguments)
+            function_arguments = '{}' if function_name == '{}}' else function_arguments
+            print(function_name, function_arguments)
             bHasError = False
             if function_id is None:
                 a = extract_json_from_string(content_arguments)
@@ -545,13 +553,37 @@ class ConnectionHandler:
         remaining_text = full_text[processed_chars:]
         if remaining_text:
             segment_text = get_string_no_punctuation_or_emoji(remaining_text)
+            print(segment_text)
             if segment_text:
-                text_index += 1
-                self.recode_first_last_text(segment_text, text_index)
-                future = self.executor.submit(
-                    self.speak_and_play, segment_text, text_index
-                )
-                self.tts_queue.put(future)
+                if function_call:=re.search('[a-zA-Z0-9_-]+[\n|>]{.*}',segment_text):
+                    function_name, function_arguments = re.split('[\n|>]', function_call.group())
+                    function_id = str(uuid.uuid4().hex)
+                    self.logger.bind(tag=TAG).info(
+                        f"function_name={function_name}, function_id={function_id}, function_arguments={function_arguments}"
+                    )
+                    function_call_data = {
+                        "name": function_name,
+                        "id": function_id,
+                        "arguments": function_arguments,
+                    }
+
+                    # 处理MCP工具调用
+                    if self.mcp_manager.is_mcp_tool(function_name):
+                        result = self._handle_mcp_tool_call(function_call_data)
+                    else:
+                        # 处理系统函数
+                        result = self.func_handler.handle_llm_function_call(
+                            self, function_call_data
+                        )
+                    self._handle_function_result(result, function_call_data, text_index + 1)
+                    response_message.clear()
+                else:
+                    text_index += 1
+                    self.recode_first_last_text(segment_text, text_index)
+                    future = self.executor.submit(
+                        self.speak_and_play, segment_text, text_index
+                    )
+                    self.tts_queue.put(future)
 
         # 存储对话内容
         if len(response_message) > 0:
@@ -610,11 +642,14 @@ class ConnectionHandler:
 
     def _handle_function_result(self, result, function_call_data, text_index):
         if result.action == Action.RESPONSE:  # 直接回复前端
-            text = result.response
+            ''''text = result.response
             self.recode_first_last_text(text, text_index)
             future = self.executor.submit(self.speak_and_play, text, text_index)
             self.tts_queue.put(future)
-            self.dialogue.put(Message(role="assistant", content=text))
+            self.dialogue.put(Message(role="assistant", content=text))'''
+            result.action = Action.REQLLM
+            result.result = f'只用回复“{result.response}”'
+            self._handle_function_result(result, function_call_data, text_index)
         elif result.action == Action.REQLLM:  # 调用函数后再请求llm生成回复
 
             text = result.result
@@ -640,7 +675,7 @@ class ConnectionHandler:
                 )
 
                 self.dialogue.put(
-                    Message(role="tool", tool_call_id=function_id, content=text)
+                    Message(role="tool", tool_call_id=function_id, content=text + '\n警告：临时数据，请勿重复使用，后续需重新使用工具获取最新数据！')
                 )
                 self.chat_with_function_calling(text, tool_call=True)
         elif result.action == Action.NOTFOUND:
@@ -804,7 +839,7 @@ class ConnectionHandler:
             # q.queue.put(None)
 
     def reset_vad_states(self):
-        self.client_audio_buffer = bytes()
+        self.client_audio_buffer = bytearray()
         self.client_have_voice = False
         self.client_have_voice_last_time = 0
         self.client_voice_stop = False
@@ -820,3 +855,4 @@ class ConnectionHandler:
             self.close_after_chat = True
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"Chat and close error: {str(e)}")
+
